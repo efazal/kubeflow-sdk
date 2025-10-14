@@ -26,6 +26,7 @@ from kubeflow.trainer.constants.constants import DATASET_PATH, MODEL_PATH  # noq
 # Import the Kubeflow Trainer types.
 from kubeflow.trainer.types.types import (
     BuiltinTrainer,
+    CheckpointConfig,
     CustomTrainer,
     DataFormat,
     DataType,
@@ -33,8 +34,11 @@ from kubeflow.trainer.types.types import (
     HuggingFaceModelInitializer,
     Initializer,
     Loss,
+    PeriodicCheckpointConfig,
+    PVCConfig,
     Runtime,
     RuntimeTrainer,
+    StorageConfig,
     TorchTuneConfig,
     TorchTuneInstructDataset,
     TrainerType,
@@ -42,6 +46,7 @@ from kubeflow.trainer.types.types import (
 
 __all__ = [
     "BuiltinTrainer",
+    "CheckpointConfig",
     "CustomTrainer",
     "DataFormat",
     "DATASET_PATH",
@@ -51,7 +56,10 @@ __all__ = [
     "Initializer",
     "Loss",
     "MODEL_PATH",
+    "PeriodicCheckpointConfig",
+    "PVCConfig",
     "Runtime",
+    "StorageConfig",
     "TorchTuneConfig",
     "TorchTuneInstructDataset",
     "RuntimeTrainer",

@@ -38,6 +38,8 @@ class CustomTrainer:
         num_nodes (`Optional[int]`): The number of nodes to use for training.
         resources_per_node (`Optional[dict]`): The computing resources to allocate per node.
         env (`Optional[dict[str, str]]`): The environment variables to set in the training nodes.
+        checkpoint_config (`Optional[CheckpointConfig]`): Model checkpointing configuration.
+        storage (`Optional[StorageConfig]`): Checkpoint storage configuration.
     """
 
     func: Callable
@@ -49,6 +51,8 @@ class CustomTrainer:
     num_nodes: Optional[int] = None
     resources_per_node: Optional[dict] = None
     env: Optional[dict[str, str]] = None
+    checkpoint_config: Optional["CheckpointConfig"] = None
+    storage: Optional["StorageConfig"] = None
 
 
 # TODO(Electronic-Waste): Add more loss functions.
@@ -77,6 +81,68 @@ class DataFormat(Enum):
     ARROW = "arrow"
     TEXT = "text"
     XML = "xml"
+
+
+# Configuration for periodic checkpoint saving.
+@dataclass
+class PeriodicCheckpointConfig:
+    """Configuration for periodic checkpoint saving during training.
+
+    Args:
+        strategy (`str`): When to save checkpoints: "epoch", "steps", or "no". Default: "epoch".
+        save_steps (`Optional[int]`): Number of training steps between checkpoints. Only used when strategy is "steps".
+        save_limit (`int`): Maximum number of checkpoints to retain. Older checkpoints are deleted. Default: 5.
+    """
+
+    strategy: str = "epoch"
+    save_steps: Optional[int] = None
+    save_limit: int = 5
+
+
+# Configuration for model checkpointing.
+@dataclass
+class CheckpointConfig:
+    """Model checkpointing configuration.
+
+    Args:
+        enable_jit_checkpoint (`bool`): Enable Just-In-Time checkpointing on graceful termination (SIGTERM). Default: False.
+        periodic_checkpoint (`Optional[PeriodicCheckpointConfig]`): Configuration for periodic checkpoint saving.
+        output_dir (`Optional[str]`): Checkpoint storage location. If not set, uses framework's default output directory.
+    """
+
+    enable_jit_checkpoint: bool = False
+    periodic_checkpoint: Optional[PeriodicCheckpointConfig] = None
+    output_dir: Optional[str] = None
+
+
+# Configuration for PVC storage.
+@dataclass
+class PVCConfig:
+    """PVC (Persistent Volume Claim) storage configuration.
+
+    Args:
+        claim_name (`Optional[str]`): Name of an existing PVC to use. If specified, size and storage_class are ignored.
+        size (`Optional[str]`): Storage size to provision (e.g., "500Gi"). Only used if claim_name is not specified.
+        storage_class (`Optional[str]`): Storage class for auto-provisioned PVC.
+        mount_path (`str`): Where the PVC is mounted in the container. Default: "/checkpoints".
+    """
+
+    claim_name: Optional[str] = None
+    size: Optional[str] = None
+    storage_class: Optional[str] = None
+    mount_path: str = "/checkpoints"
+
+
+# Configuration for checkpoint storage.
+@dataclass
+class StorageConfig:
+    """Checkpoint storage configuration.
+
+    Args:
+        pvc (`Optional[PVCConfig]`): PVC storage configuration.
+    """
+
+    pvc: Optional[PVCConfig] = None
 
 
 # Configuration for the TorchTune Instruct dataset.
@@ -150,9 +216,13 @@ class BuiltinTrainer:
 
     Args:
         config (`TorchTuneConfig`): The configuration for the builtin trainer.
+        checkpoint_config (`Optional[CheckpointConfig]`): Model checkpointing configuration.
+        storage (`Optional[StorageConfig]`): Checkpoint storage configuration.
     """
 
     config: TorchTuneConfig
+    checkpoint_config: Optional["CheckpointConfig"] = None
+    storage: Optional["StorageConfig"] = None
 
 
 # Change it to list: BUILTIN_CONFIGS, once we support more Builtin Trainer configs.

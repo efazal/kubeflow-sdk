@@ -255,6 +255,113 @@ def get_resources_per_node(
     return resources
 
 
+def _uses_transformers(func_code: str) -> bool:
+    """
+    Detect if the training function imports or uses Transformers.
+
+    Args:
+        func_code: Source code of the training function.
+
+    Returns:
+        True if Transformers is detected, False otherwise.
+    """
+    return (
+        "from transformers import" in func_code or
+        "import transformers" in func_code
+    )
+
+
+def inject_checkpoint_wrapper(func_code: str, checkpoint_config) -> str:
+    """
+    Injects monkey-patch code inside the training function to auto-inject checkpoint settings.
+    The monkey-patch is injected right before the first transformers import statement.
+
+    Args:
+        func_code: Source code of the training function.
+        checkpoint_config: CheckpointConfig instance with checkpoint settings.
+
+    Returns:
+        Modified function code with checkpoint injection logic.
+    """
+    # Extract checkpoint config values
+    enable_jit = checkpoint_config.enable_jit_checkpoint
+
+    # Build periodic checkpoint injection code if configured
+    periodic_checkpoint_code = ""
+    if checkpoint_config.periodic_checkpoint:
+        strategy = checkpoint_config.periodic_checkpoint.strategy
+        save_limit = checkpoint_config.periodic_checkpoint.save_limit
+        save_steps = checkpoint_config.periodic_checkpoint.save_steps
+
+        periodic_checkpoint_code = f'''
+        if "save_strategy" not in kwargs:
+            kwargs["save_strategy"] = "{strategy}"
+        if "save_total_limit" not in kwargs:
+            kwargs["save_total_limit"] = {save_limit}'''
+
+        # Add save_steps if strategy is "steps"
+        if save_steps is not None and strategy == "steps":
+            periodic_checkpoint_code += f'''
+        if "save_steps" not in kwargs:
+            kwargs["save_steps"] = {save_steps}'''
+
+    # Create the monkey-patch code to inject (without try-except since we already detect transformers)
+    monkey_patch_code = f'''# Monkey-patch TrainingArguments to inject checkpoint config
+import sys
+from transformers import TrainingArguments as _OriginalTrainingArguments
+
+class PatchedTrainingArguments(_OriginalTrainingArguments):
+    def __init__(self, *args, **kwargs):
+        # Inject checkpoint config if not explicitly set by user
+        if {enable_jit} and "enable_jit_checkpoint" not in kwargs:
+            kwargs["enable_jit_checkpoint"] = True{periodic_checkpoint_code}
+        super().__init__(*args, **kwargs)
+
+# Replace TrainingArguments globally
+sys.modules['transformers'].TrainingArguments = PatchedTrainingArguments
+'''
+
+    # Parse the function code to find where to inject the monkey-patch
+    lines = func_code.split('\n')
+    modified_lines = []
+    patch_injected = False
+
+    for i, line in enumerate(lines):
+        # Check if this line imports from transformers
+        stripped = line.strip()
+        if not patch_injected and (
+            stripped.startswith('from transformers import') or
+            stripped.startswith('import transformers')
+        ):
+            # Inject monkey-patch code right before this import
+            # Detect the indentation level of the current line
+            indent = len(line) - len(line.lstrip())
+            base_indent = ' ' * indent
+
+            # Add monkey-patch with proper indentation, preserving internal structure
+            patch_lines = monkey_patch_code.strip().split('\n')
+            for patch_line in patch_lines:
+                if patch_line.strip():  # Non-empty line
+                    # Preserve the line's internal indentation relative to its first line
+                    # by adding base_indent to the entire line
+                    modified_lines.append(base_indent + patch_line)
+                else:  # Empty line
+                    modified_lines.append('')
+
+            # Add a blank line after the monkey-patch for readability
+            modified_lines.append('')
+            patch_injected = True
+
+        # Add the original line
+        modified_lines.append(line)
+
+    # If no transformers import was found, return original code unchanged
+    if not patch_injected:
+        return func_code
+
+    return '\n'.join(modified_lines)
+
+
 def get_script_for_python_packages(
     packages_to_install: list[str],
     pip_index_urls: list[str],
@@ -299,6 +406,7 @@ def get_command_using_train_func(
     train_func_parameters: Optional[dict[str, Any]],
     pip_index_urls: list[str],
     packages_to_install: Optional[list[str]],
+    checkpoint_config: Optional[types.CheckpointConfig] = None,
 ) -> list[str]:
     """
     Get the Trainer container command from the given training function and parameters.
@@ -323,6 +431,10 @@ def get_command_using_train_func(
     # We need to dedent the function code.
     func_code = textwrap.dedent(func_code)
 
+    # Inject checkpoint wrapper if checkpoint_config is provided and Transformers is used
+    if checkpoint_config.enable_jit_checkpoint and _uses_transformers(func_code):
+        func_code = inject_checkpoint_wrapper(func_code, checkpoint_config)
+
     # Wrap function code to execute it from the file. For example:
     # TODO (andreyvelich): Find a better way to run users' scripts.
     # def train(parameters):
@@ -331,8 +443,8 @@ def get_command_using_train_func(
     if train_func_parameters is None:
         func_call = f"{train_func.__name__}()"
     else:
-        # Always unpack kwargs for training function calls.
-        func_call = f"{train_func.__name__}(**{train_func_parameters})"
+        # Pass parameters dict as single positional argument
+        func_call = f"{train_func.__name__}({train_func_parameters})"
 
     # Combine everything into the final code string.
     func_code = f"{func_code}\n{func_call}\n"
@@ -382,7 +494,7 @@ def get_trainer_crd_from_custom_trainer(
     if trainer.resources_per_node:
         trainer_crd.resources_per_node = get_resources_per_node(trainer.resources_per_node)
 
-    # Add command to the Trainer.
+    # Add command to the Trainer with checkpoint injection if provided.
     # TODO: Support train function parameters.
     trainer_crd.command = get_command_using_train_func(
         runtime,
@@ -390,6 +502,7 @@ def get_trainer_crd_from_custom_trainer(
         trainer.func_args,
         trainer.pip_index_urls,
         trainer.packages_to_install,
+        checkpoint_config=trainer.checkpoint_config,
     )
 
     # Add environment variables to the Trainer.
@@ -411,6 +524,13 @@ def get_trainer_crd_from_builtin_trainer(
     """
     if not isinstance(trainer.config, types.TorchTuneConfig):
         raise ValueError(f"The BuiltinTrainer config is invalid: {trainer.config}")
+
+    # Validate checkpoint_config for TorchTune
+    if trainer.checkpoint_config:
+        raise ValueError(
+            "Checkpoint config is not supported for TorchTune trainers. "
+            "JIT checkpointing is only available for Transformers/TRL-based trainers."
+        )
 
     trainer_crd = models.TrainerV1alpha1Trainer()
 
