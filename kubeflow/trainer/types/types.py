@@ -51,6 +51,7 @@ class CustomTrainer:
     num_nodes: Optional[int] = None
     resources_per_node: Optional[dict] = None
     env: Optional[dict[str, str]] = None
+    enable_jit_checkpoint: bool = False
 
 
 # Configuration for the Custom Trainer Container.

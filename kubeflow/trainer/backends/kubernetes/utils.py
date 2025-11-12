@@ -278,6 +278,7 @@ def get_command_using_train_func(
     train_func_parameters: Optional[dict[str, Any]],
     pip_index_urls: list[str],
     packages_to_install: Optional[list[str]],
+    enable_jit_checkpoint: bool = False,
 ) -> list[str]:
     """
     Get the Trainer container command from the given training function and parameters.
@@ -301,6 +302,15 @@ def get_command_using_train_func(
     # Function might be defined in some indented scope (e.g. in another function).
     # We need to dedent the function code.
     func_code = textwrap.dedent(func_code)
+
+    # Inject JIT checkpoint code if enabled
+    if enable_jit_checkpoint:
+        from kubeflow.trainer.backends.kubernetes.jit_checkpoint_template import (
+            get_jit_checkpoint_injection_code,
+        )
+
+        checkpoint_code = get_jit_checkpoint_injection_code()
+        func_code = f"{checkpoint_code}\n{func_code}"
 
     # Wrap function code to execute it from the file. For example:
     # TODO (andreyvelich): Find a better way to run users' scripts.
@@ -373,6 +383,7 @@ def get_trainer_cr_from_custom_trainer(
             trainer.func_args,
             trainer.pip_index_urls,
             trainer.packages_to_install,
+            trainer.enable_jit_checkpoint,
         )
     else:
         # Alternatively, set the Trainer image.
