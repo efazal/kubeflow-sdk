@@ -279,9 +279,24 @@ def get_command_using_train_func(
     pip_index_urls: list[str],
     packages_to_install: Optional[list[str]],
     enable_jit_checkpoint: bool = False,
+    output_dir: Optional[str] = None,
+    periodic_checkpoint_config: Optional[Any] = None,
 ) -> list[str]:
     """
     Get the Trainer container command from the given training function and parameters.
+
+    Args:
+        runtime: The runtime to use for training.
+        train_func: The training function to execute.
+        train_func_parameters: Parameters to pass to the training function.
+        pip_index_urls: PyPI URLs to use for package installation.
+        packages_to_install: Python packages to install before training.
+        enable_jit_checkpoint: Whether to inject JIT checkpoint code.
+        output_dir: Directory where checkpoints and outputs will be saved.
+        periodic_checkpoint_config: Configuration for periodic checkpointing.
+
+    Returns:
+        List of command strings for the container.
     """
     # Check if the runtime has a Trainer.
     if not runtime.trainer:
@@ -304,12 +319,41 @@ def get_command_using_train_func(
     func_code = textwrap.dedent(func_code)
 
     # Inject JIT checkpoint code if enabled
+    checkpoint_env_setup = ""
     if enable_jit_checkpoint:
         from kubeflow.trainer.backends.kubernetes.jit_checkpoint_template import (
             get_jit_checkpoint_injection_code,
         )
 
         checkpoint_code = get_jit_checkpoint_injection_code()
+
+        # Prepare environment variables for checkpoint configuration
+        import json
+
+        env_vars = []
+
+        # Add output_dir if specified
+        if output_dir:
+            env_vars.append(f'export KUBEFLOW_OUTPUT_DIR="{output_dir}"')
+
+        # Add periodic checkpoint config if specified
+        if periodic_checkpoint_config:
+            checkpoint_config_dict = {
+                "save_strategy": periodic_checkpoint_config.save_strategy.value if hasattr(periodic_checkpoint_config.save_strategy, 'value') else str(periodic_checkpoint_config.save_strategy),
+                "save_steps": periodic_checkpoint_config.save_steps,
+                "save_total_limit": periodic_checkpoint_config.save_total_limit,
+                "load_best_model_at_end": periodic_checkpoint_config.load_best_model_at_end,
+            }
+            checkpoint_config_json = json.dumps(checkpoint_config_dict)
+            # Escape quotes for shell
+            checkpoint_config_json = checkpoint_config_json.replace('"', '\\"')
+            env_vars.append(f'export KUBEFLOW_CHECKPOINT_CONFIG="{checkpoint_config_json}"')
+
+        # Store env vars separately to inject into bash script later
+        if env_vars:
+            checkpoint_env_setup = "\n".join(env_vars) + "\n"
+
+        # Add checkpoint code to Python function code (not env vars)
         func_code = f"{checkpoint_code}\n{func_code}"
 
     # Wrap function code to execute it from the file. For example:
@@ -345,6 +389,10 @@ def get_command_using_train_func(
     for c in runtime.trainer.command:
         if "{func_file}" in c:
             exec_script = c.format(func_code=func_code, func_file=func_file)
+            # Prepend checkpoint environment variables (if any)
+            if checkpoint_env_setup:
+                exec_script = checkpoint_env_setup + exec_script
+            # Prepend package installation (if any)
             if install_packages:
                 exec_script = install_packages + exec_script
             command.append(exec_script)
@@ -384,6 +432,8 @@ def get_trainer_cr_from_custom_trainer(
             trainer.pip_index_urls,
             trainer.packages_to_install,
             trainer.enable_jit_checkpoint,
+            trainer.output_dir,
+            trainer.periodic_checkpoint_config,
         )
     else:
         # Alternatively, set the Trainer image.

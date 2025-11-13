@@ -21,6 +21,12 @@ from urllib.parse import urlparse
 
 import kubeflow.common.constants as common_constants
 from kubeflow.trainer.constants import constants
+from kubeflow.trainer.types.checkpoint_config import (
+    PeriodicCheckpointConfig,
+    PVCStorageConfig,
+    S3StorageConfig,
+    SaveStrategy,
+)
 
 
 # Configuration for the Custom Trainer.
@@ -51,7 +57,10 @@ class CustomTrainer:
     num_nodes: Optional[int] = None
     resources_per_node: Optional[dict] = None
     env: Optional[dict[str, str]] = None
+    output_dir: Optional[str] = None
     enable_jit_checkpoint: bool = False
+    periodic_checkpoint_config: Optional["PeriodicCheckpointConfig"] = None
+    storage_config: Optional[Union["S3StorageConfig", "PVCStorageConfig"]] = None
 
 
 # Configuration for the Custom Trainer Container.
