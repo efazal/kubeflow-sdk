@@ -22,14 +22,25 @@ maintainable as regular Python code.
 
 import inspect
 import textwrap
+from typing import Optional
 
 
-def get_jit_checkpoint_injection_code() -> str:
+def get_jit_checkpoint_injection_code(
+    output_dir: Optional[str] = None,
+    periodic_checkpoint_config: Optional[dict] = None,
+    enable_jit_checkpoint: bool = False,
+) -> str:
     """Generate the complete JIT checkpoint code to inject into training scripts.
 
     This function extracts real Python code from jit_checkpoint_code.py using
     inspect.getsource(), allowing the checkpoint code to be maintained as
     navigatable, type-checked Python instead of a string literal.
+
+    Args:
+        output_dir: Output directory for checkpoints
+        periodic_checkpoint_config: Periodic checkpoint configuration dict
+            with keys: save_strategy, save_steps, save_total_limit
+        enable_jit_checkpoint: Whether to inject JIT checkpoint classes and callback
 
     Returns:
         str: Complete Python code for JIT checkpointing functionality.
@@ -37,31 +48,39 @@ def get_jit_checkpoint_injection_code() -> str:
     # Import the actual Python code module
     from kubeflow.trainer.backends.kubernetes import jit_checkpoint_code
 
-    # Extract source code for classes and functions
-    checkpoint_manager_src = inspect.getsource(jit_checkpoint_code.CheckpointManager)
-    callback_src = inspect.getsource(jit_checkpoint_code.JITCheckpointCallback)
+    # Extract monkey-patch source (always needed)
     monkey_patch_src = inspect.getsource(jit_checkpoint_code.setup_jit_checkpoint_monkey_patch)
 
-    # Build the complete injection code
-    header = textwrap.dedent(
-        """
-        # ============================================================================
-        # JIT Checkpoint Code (Auto-injected by Kubeflow SDK)
-        # ============================================================================
+    # Only extract JIT checkpoint classes if JIT is enabled
+    checkpoint_manager_src = ""
+    callback_src = ""
+    if enable_jit_checkpoint:
+        checkpoint_manager_src = inspect.getsource(jit_checkpoint_code.CheckpointManager)
+        # callback_src = inspect.getsource(jit_checkpoint_code.JITCheckpointCallback)
 
-        import os
-        import signal
-        import threading
-        from typing import Optional
-        from transformers import Trainer as _TransformersTrainer
-        from transformers import TrainerCallback
-        from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-        from transformers.utils import logging as transformers_logging
+    # Build checkpoint config dict as Python code
+    config_lines = []
+    config_lines.append("# ============================================================================")
+    config_lines.append("# Kubeflow Checkpoint Configuration (Auto-injected)")
+    config_lines.append("# ============================================================================")
+    config_lines.append("_KUBEFLOW_CHECKPOINT_CONFIG = {")
 
-        _jit_logger = transformers_logging.get_logger(__name__)
+    # Add enable_jit flag
+    config_lines.append(f'    "enable_jit": {enable_jit_checkpoint},')
 
-        """
-    ).strip()
+    if output_dir:
+        config_lines.append(f'    "output_dir": {repr(output_dir)},')
+
+    if periodic_checkpoint_config:
+        if "save_strategy" in periodic_checkpoint_config:
+            config_lines.append(f'    "save_strategy": {repr(periodic_checkpoint_config["save_strategy"])},')
+        if "save_steps" in periodic_checkpoint_config:
+            config_lines.append(f'    "save_steps": {periodic_checkpoint_config["save_steps"]},')
+        if "save_total_limit" in periodic_checkpoint_config:
+            config_lines.append(f'    "save_total_limit": {periodic_checkpoint_config["save_total_limit"]},')
+
+    config_lines.append("}")
+    config_code = "\n".join(config_lines)
 
     # Invoke monkey-patch at module level
     monkey_patch_invocation = textwrap.dedent(
@@ -74,11 +93,9 @@ def get_jit_checkpoint_injection_code() -> str:
         try:
             setup_jit_checkpoint_monkey_patch()
         except ImportError as e:
-            _jit_logger.warning(f"Could not import Transformers Trainer for monkey-patching: {e}")
-            print(f"Warning: Transformers not available, JIT checkpoint will not work: {e}")
+            print(f"[Kubeflow] Warning: Transformers not available, JIT checkpoint will not work: {e}")
         except Exception as e:
-            _jit_logger.error(f"Failed to monkey-patch Trainer.__init__: {e}")
-            print(f"Error: Failed to enable JIT checkpoint auto-instrumentation: {e}")
+            print(f"[Kubeflow] Error: Failed to enable JIT checkpoint auto-instrumentation: {e}")
 
         # ============================================================================
         # End of JIT Checkpoint Code
@@ -86,13 +103,19 @@ def get_jit_checkpoint_injection_code() -> str:
         """
     ).strip()
 
-    # Combine all parts
-    complete_code = (
-        f"{header}\n\n\n"
-        f"{checkpoint_manager_src}\n\n\n"
-        f"{callback_src}\n\n\n"
-        f"{monkey_patch_src}\n\n\n"
-        f"{monkey_patch_invocation}\n"
-    )
+    # Combine all parts: config dict, (optionally JIT classes), monkey-patch, invocation
+    parts = [config_code]
+
+    # Only include JIT classes if they were extracted
+    if enable_jit_checkpoint:
+        parts.append(checkpoint_manager_src)
+        # parts.append(callback_src)
+
+    # Always include monkey-patch and invocation
+    parts.append(monkey_patch_src)
+    parts.append(monkey_patch_invocation)
+
+    # Join with triple newlines for readability
+    complete_code = "\n\n\n".join(parts) + "\n"
 
     return complete_code

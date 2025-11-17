@@ -209,6 +209,12 @@ class KubernetesBackend(RuntimeBackend):
             trainer_overrides = spec_section.get("trainer", {})
             pod_template_overrides = spec_section.get("podTemplateOverrides")
 
+        # Process output_dir URI for PVC mounting (if trainer has output_dir)
+        if trainer and isinstance(trainer, types.CustomTrainer) and trainer.output_dir:
+            trainer.output_dir, pod_template_overrides = utils.apply_output_dir_uri_to_pod_overrides(
+                trainer.output_dir, pod_template_overrides
+            )
+
         # Generate unique name for the TrainJob if not provided
         train_job_name = name or (
             random.choice(string.ascii_lowercase)

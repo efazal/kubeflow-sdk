@@ -60,7 +60,6 @@ class CustomTrainer:
     output_dir: Optional[str] = None
     enable_jit_checkpoint: bool = False
     periodic_checkpoint_config: Optional["PeriodicCheckpointConfig"] = None
-    storage_config: Optional[Union["S3StorageConfig", "PVCStorageConfig"]] = None
 
 
 # Configuration for the Custom Trainer Container.

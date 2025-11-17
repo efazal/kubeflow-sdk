@@ -318,42 +318,47 @@ def get_command_using_train_func(
     # We need to dedent the function code.
     func_code = textwrap.dedent(func_code)
 
-    # Inject JIT checkpoint code if enabled
+    # Inject checkpoint code if JIT or periodic checkpoint is enabled
     checkpoint_env_setup = ""
-    if enable_jit_checkpoint:
+
+    # Scenario 1: If JIT enabled but no periodic config, create defaults
+    if enable_jit_checkpoint and periodic_checkpoint_config is None:
+        from kubeflow.trainer.types.checkpoint_config import (
+            PeriodicCheckpointConfig,
+            SaveStrategy,
+        )
+
+        periodic_checkpoint_config = PeriodicCheckpointConfig(
+            save_strategy=SaveStrategy.EPOCH, save_total_limit=3
+        )
+
+    # Inject checkpoint code if either JIT or periodic checkpoint is configured
+    if enable_jit_checkpoint or periodic_checkpoint_config:
         from kubeflow.trainer.backends.kubernetes.jit_checkpoint_template import (
             get_jit_checkpoint_injection_code,
         )
 
-        checkpoint_code = get_jit_checkpoint_injection_code()
-
-        # Prepare environment variables for checkpoint configuration
-        import json
-
-        env_vars = []
-
-        # Add output_dir if specified
-        if output_dir:
-            env_vars.append(f'export KUBEFLOW_OUTPUT_DIR="{output_dir}"')
-
-        # Add periodic checkpoint config if specified
+        # Prepare periodic checkpoint config dict
+        checkpoint_config_dict = None
         if periodic_checkpoint_config:
             checkpoint_config_dict = {
-                "save_strategy": periodic_checkpoint_config.save_strategy.value if hasattr(periodic_checkpoint_config.save_strategy, 'value') else str(periodic_checkpoint_config.save_strategy),
+                "save_strategy": (
+                    periodic_checkpoint_config.save_strategy.value
+                    if hasattr(periodic_checkpoint_config.save_strategy, "value")
+                    else str(periodic_checkpoint_config.save_strategy)
+                ),
                 "save_steps": periodic_checkpoint_config.save_steps,
-                "save_total_limit": periodic_checkpoint_config.save_total_limit,
-                "load_best_model_at_end": periodic_checkpoint_config.load_best_model_at_end,
+                "save_total_limit": periodic_checkpoint_config.save_total_limit
             }
-            checkpoint_config_json = json.dumps(checkpoint_config_dict)
-            # Escape quotes for shell
-            checkpoint_config_json = checkpoint_config_json.replace('"', '\\"')
-            env_vars.append(f'export KUBEFLOW_CHECKPOINT_CONFIG="{checkpoint_config_json}"')
 
-        # Store env vars separately to inject into bash script later
-        if env_vars:
-            checkpoint_env_setup = "\n".join(env_vars) + "\n"
+        # Generate checkpoint code with config injected as Python dict
+        checkpoint_code = get_jit_checkpoint_injection_code(
+            output_dir=output_dir,
+            periodic_checkpoint_config=checkpoint_config_dict,
+            enable_jit_checkpoint=enable_jit_checkpoint,
+        )
 
-        # Add checkpoint code to Python function code (not env vars)
+        # Add checkpoint code to Python function code
         func_code = f"{checkpoint_code}\n{func_code}"
 
     # Wrap function code to execute it from the file. For example:
@@ -672,3 +677,160 @@ def get_model_initializer(
         )
 
     raise ValueError(f"Model initializer type is invalid: {type(model)}")
+
+
+def parse_output_dir_uri(output_dir: Optional[str]) -> tuple[Optional[str], Optional[dict]]:
+    """Parse output_dir URI and return resolved path + volume mount specs.
+
+    Args:
+        output_dir: Output directory URI (e.g., "pvc://pvc-name/path") or local path.
+
+    Returns:
+        Tuple of (resolved_path, volume_mount_specs).
+        - resolved_path: Local filesystem path where checkpoints will be saved
+        - volume_mount_specs: Dict with "volume" and "volumeMount" specs for PVC mounting,
+                             or None for local paths
+
+    Supported URI schemes:
+        - pvc://<pvc-name>/<checkpoint-path>: Kubernetes PersistentVolumeClaim
+        - Local path (no scheme): Direct filesystem path
+
+    Raises:
+        ValueError: If an unsupported URI scheme is provided (e.g., s3://, gs://)
+
+    Example:
+        >>> parse_output_dir_uri("pvc://training-pvc/llama3-finetune")
+        ("/mnt/kubeflow-checkpoints/llama3-finetune", {...volume specs...})
+
+        >>> parse_output_dir_uri("/mnt/local/checkpoints")
+        ("/mnt/local/checkpoints", None)
+    """
+    if not output_dir:
+        return None, None
+
+    # Check for unsupported URI schemes
+    unsupported_schemes = ["s3://", "gs://", "minio://", "http://", "https://", "ftp://"]
+    for scheme in unsupported_schemes:
+        if output_dir.startswith(scheme):
+            raise ValueError(
+                f"Unsupported storage URI scheme: '{scheme}'. "
+                f"Currently only 'pvc://' URIs are supported for automatic mounting. "
+                f"Supported formats: 'pvc://<pvc-name>/<path>' or local filesystem paths."
+            )
+
+    # PVC URI: pvc://<pvc-name>/<checkpoint-path>
+    if output_dir.startswith("pvc://"):
+        # Parse URI: strip "pvc://" prefix and split into PVC name and path
+        uri_path = output_dir[len("pvc://"):]
+        parts = uri_path.split("/", 1)
+        pvc_name = parts[0]
+        checkpoint_path = parts[1] if len(parts) > 1 else ""
+
+        # SDK mounts PVC at a standard location
+        mount_path = "/mnt/kubeflow-checkpoints"
+        resolved_path = f"{mount_path}/{checkpoint_path}" if checkpoint_path else mount_path
+
+        # Build Kubernetes volume and volumeMount specs
+        volume_spec = {
+            "name": "checkpoint-storage",
+            "persistentVolumeClaim": {"claimName": pvc_name}
+        }
+        volume_mount_spec = {
+            "name": "checkpoint-storage",
+            "mountPath": mount_path
+        }
+
+        return resolved_path, {"volume": volume_spec, "volumeMount": volume_mount_spec}
+
+    # Local path - no URI scheme, return as-is
+    return output_dir, None
+
+
+def apply_output_dir_uri_to_pod_overrides(
+    output_dir: str,
+    pod_template_overrides: Optional[list],
+) -> tuple[str, list]:
+    """Process output_dir URI and apply PVC mounting to pod template overrides.
+
+    This function parses the output_dir URI (e.g., "pvc://...") and automatically
+    adds the necessary volume and volumeMount configuration to pod_template_overrides
+    for the trainer container.
+
+    Args:
+        output_dir: Output directory URI or local path
+        pod_template_overrides: Existing pod template overrides list (may be None)
+
+    Returns:
+        Tuple of (resolved_output_dir, updated_pod_template_overrides)
+        - resolved_output_dir: Local filesystem path where checkpoints will be saved
+        - updated_pod_template_overrides: Updated list with PVC mounting configuration
+
+    Example:
+        >>> overrides = apply_output_dir_uri_to_pod_overrides(
+        ...     "pvc://my-pvc/checkpoints",
+        ...     None
+        ... )
+        >>> # Returns: ("/mnt/kubeflow-checkpoints/checkpoints", [...override list...])
+    """
+    resolved_output_dir, volume_mount_specs = parse_output_dir_uri(output_dir)
+
+    # If no PVC mounting needed, return as-is
+    if volume_mount_specs is None:
+        return resolved_output_dir, pod_template_overrides
+
+    # Initialize pod_template_overrides as list if needed
+    if pod_template_overrides is None:
+        pod_template_overrides = []
+
+    # Find existing override for node target job, or create new one
+    node_override = None
+    for override in pod_template_overrides:
+        target_jobs = override.get("targetJobs", [])
+        if any(job.get("name") == constants.NODE for job in target_jobs):
+            node_override = override
+            break
+
+    if node_override is None:
+        # Create new override targeting the node job
+        node_override = {
+            "targetJobs": [{"name": constants.NODE}],
+            "spec": {}
+        }
+        pod_template_overrides.append(node_override)
+
+    # Ensure spec dict exists
+    if "spec" not in node_override:
+        node_override["spec"] = {}
+
+    spec_dict = node_override["spec"]
+
+    # Add volume to spec
+    if "volumes" not in spec_dict:
+        spec_dict["volumes"] = []
+    spec_dict["volumes"].append(volume_mount_specs["volume"])
+
+    # Add volumeMount to the trainer container
+    if "containers" not in spec_dict:
+        spec_dict["containers"] = []
+
+    # Find the trainer container (node) in containers list
+    trainer_container_dict = None
+    for container_dict in spec_dict["containers"]:
+        if container_dict.get("name") == constants.NODE:
+            trainer_container_dict = container_dict
+            break
+
+    if trainer_container_dict is None:
+        # Create new container override for trainer
+        trainer_container_dict = {
+            "name": constants.NODE,
+            "volumeMounts": []
+        }
+        spec_dict["containers"].append(trainer_container_dict)
+
+    # Add volumeMount to trainer container
+    if "volumeMounts" not in trainer_container_dict:
+        trainer_container_dict["volumeMounts"] = []
+    trainer_container_dict["volumeMounts"].append(volume_mount_specs["volumeMount"])
+
+    return resolved_output_dir, pod_template_overrides
