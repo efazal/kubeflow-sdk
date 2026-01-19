@@ -303,9 +303,52 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
     class JITCheckpointCallback(TrainerCallback):
         """Transformers callback that integrates JIT checkpointing with trainer lifecycle."""
 
-        def __init__(self):
+        def __init__(self, storage_uri=None):
             self.jit_manager = None
             self._trainer_ref = None
+
+            # Storage configuration (supports s3://, gs://, az://, etc.)
+            self.storage_uri = storage_uri
+            self.storage_fs = None
+            self.storage_protocol = None
+            self.storage_base_path = None  # Base path in storage (bucket/prefix)
+
+            if storage_uri and "://" in storage_uri:
+                import subprocess
+                import sys
+
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "s3fs"])
+                # Parse storage URI: protocol://bucket/prefix
+                self.storage_protocol = storage_uri.split("://")[0]
+                path_part = storage_uri.split("://", 1)[1]
+
+                # Storage base path is everything after protocol (bucket/prefix)
+                self.storage_base_path = path_part
+
+                # Initialize fsspec filesystem (auto-selects backend: s3fs, gcsfs, adlfs, etc.)
+                import fsspec
+
+                # Protocol-specific configuration (only non-standard settings)
+                # fsspec backends auto-detect credentials from environment variables
+                fs_kwargs = {}
+                if self.storage_protocol == "s3":
+                    # Only pass custom endpoint and SSL settings for non-AWS S3 (MinIO, Ceph, etc.)
+                    endpoint_url = os.environ.get("AWS_S3_ENDPOINT")
+                    if endpoint_url:
+                        fs_kwargs = {
+                            "client_kwargs": {
+                                "endpoint_url": endpoint_url,
+                                "verify": False,  # For self-signed certs
+                            },
+                            "config_kwargs": {"signature_version": "s3v4"},
+                        }
+                # GCS and Azure auto-detect credentials, no custom config needed
+
+                self.storage_fs = fsspec.filesystem(self.storage_protocol, **fs_kwargs)
+                print(
+                    f"[Kubeflow] Storage configured: {storage_uri} ({self.storage_protocol})",
+                    flush=True,
+                )
 
         def on_train_begin(self, args, state, control, **kwargs):
             if self._trainer_ref is not None and self.jit_manager is None:
@@ -341,11 +384,232 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
                 control.should_save = False
                 control.should_training_stop = True
 
+        def on_init_end(self, args, state, control, **kwargs):
+            """Download latest checkpoint from storage before training starts.
+
+            Task 4: checkpoint download/resume
+            - Find latest valid checkpoint in storage
+            - Skip checkpoints with .incomplete marker
+            - Download to local output_dir
+            - HuggingFace will auto-resume from local checkpoint
+            """
+            if not self.storage_fs or not state.is_world_process_zero:
+                return
+
+            try:
+                print(
+                    f"[Kubeflow] Checking for checkpoints in {self.storage_protocol}...", flush=True
+                )
+
+                # Find latest valid checkpoint in storage
+                latest_checkpoint = self._find_latest_checkpoint_storage()
+                if not latest_checkpoint:
+                    print(
+                        "[Kubeflow] No checkpoint found in storage, starting fresh training",
+                        flush=True,
+                    )
+                    return
+
+                # Download to local output_dir
+                local_dir = args.output_dir
+                print(
+                    f"[Kubeflow] Downloading checkpoint: {latest_checkpoint} "
+                    f"to path {args.output_dir}",
+                    flush=True,
+                )
+                start_time = time.time()
+
+                self._download_checkpoint_from_storage(latest_checkpoint, local_dir)
+
+                duration = time.time() - start_time
+                print(
+                    f"[Kubeflow] ✓ Download complete: {latest_checkpoint} in {duration:.2f}s",
+                    flush=True,
+                )
+
+            except Exception as e:
+                print(f"[Kubeflow] Warning: Failed to download from storage: {e}", flush=True)
+                import traceback
+
+                traceback.print_exc()
+
+        def on_save(self, args, state, control, **kwargs):
+            """Upload checkpoint to storage after HuggingFace saves it locally.
+
+            Task 6: Upload checkpoint to storage synchronously
+            - Wait for HuggingFace to finish saving checkpoint
+            - Upload entire checkpoint directory to storage (rank 0 only for now)
+            - Create .incomplete sentinel before upload
+            - Delete .incomplete sentinel after successful upload
+            - Synchronous for now (blocking), will make async in Task 7
+            """
+            if not self.storage_fs or not state.is_world_process_zero:
+                return
+
+            try:
+                # Get the checkpoint that was just saved
+                checkpoint_name = f"checkpoint-{state.global_step}"
+                local_checkpoint_path = os.path.join(args.output_dir, checkpoint_name)
+
+                if not os.path.exists(local_checkpoint_path):
+                    print(
+                        f"[Kubeflow] Warning: Checkpoint not found: {local_checkpoint_path}",
+                        flush=True,
+                    )
+                    return
+
+                print(
+                    f"[Kubeflow] Uploading checkpoint to {self.storage_protocol}: "
+                    f"{checkpoint_name}",
+                    flush=True,
+                )
+                start_time = time.time()
+
+                # Upload checkpoint to storage (synchronous)
+                self._upload_checkpoint_to_storage(local_checkpoint_path, checkpoint_name)
+
+                duration = time.time() - start_time
+                size_mb = self._get_dir_size_mb(local_checkpoint_path)
+                throughput = size_mb / duration if duration > 0 else 0
+                print(
+                    f"[Kubeflow] ✓ Upload complete: {checkpoint_name} "
+                    f"({size_mb:.1f}MB in {duration:.2f}s, {throughput:.2f} MB/s)",
+                    flush=True,
+                )
+
+            except Exception as e:
+                print(f"[Kubeflow] Error uploading to storage: {e}", flush=True)
+                import traceback
+
+                traceback.print_exc()
+
+        def _find_latest_checkpoint_storage(self):
+            """Find latest valid checkpoint in storage bucket.
+
+            Returns:
+                str: Checkpoint name (e.g., 'checkpoint-100') or None if not found
+            """
+            try:
+                # List all checkpoint directories using glob pattern
+                checkpoint_dirs = self.storage_fs.glob(f"{self.storage_base_path}/checkpoint-*")
+
+                # Extract step numbers and sort descending
+                checkpoint_steps = sorted(
+                    [int(path.split("-")[-1]) for path in checkpoint_dirs],
+                    reverse=True,
+                )
+
+                if not checkpoint_steps:
+                    return None
+
+                # Find first complete checkpoint (latest to oldest)
+                for step in checkpoint_steps:
+                    checkpoint_name = f"checkpoint-{step}"
+                    incomplete_marker = (
+                        f"{self.storage_base_path}/{checkpoint_name}/{CHECKPOINT_INCOMPLETE_MARKER}"
+                    )
+
+                    if self.storage_fs.exists(incomplete_marker):
+                        print(f"[Kubeflow] Skipping incomplete: {checkpoint_name}", flush=True)
+                        continue
+
+                    print(
+                        f"[Kubeflow] Found {len(checkpoint_steps)} checkpoints, "
+                        f"using: {checkpoint_name}",
+                        flush=True,
+                    )
+                    return checkpoint_name
+
+                print("[Kubeflow] All checkpoints incomplete", flush=True)
+                return None
+
+            except Exception as e:
+                print(f"[Kubeflow] Error finding checkpoint in storage: {e}", flush=True)
+                import traceback
+
+                traceback.print_exc()
+                return None
+
+        def _download_checkpoint_from_storage(self, checkpoint_name, local_dir):
+            """Download checkpoint from storage to local directory.
+
+            Args:
+                checkpoint_name: Name of checkpoint (e.g., 'checkpoint-100')
+                local_dir: Local directory to download to (args.output_dir)
+            """
+            storage_path = f"{self.storage_base_path}/{checkpoint_name}"
+
+            os.makedirs(local_dir, exist_ok=True)
+
+            # Download all files recursively using fsspec
+            print(
+                f"[Kubeflow] Downloading from {self.storage_protocol}://{storage_path} "
+                f"to {local_dir}",
+                flush=True,
+            )
+            self.storage_fs.get(storage_path, local_dir, recursive=True)
+
+        def _upload_checkpoint_to_storage(self, local_checkpoint_path, checkpoint_name):
+            """Upload checkpoint from local directory to storage.
+
+            Args:
+                local_checkpoint_path: Local path to checkpoint directory
+                checkpoint_name: Name of checkpoint (e.g., 'checkpoint-100')
+            """
+            storage_path = f"{self.storage_base_path}"
+
+            # Create incomplete marker to indicate upload in progress
+            incomplete_marker = f"{storage_path}/{checkpoint_name}/{CHECKPOINT_INCOMPLETE_MARKER}"
+            self.storage_fs.touch(incomplete_marker)
+            print(f"[Kubeflow] Created incomplete marker: {incomplete_marker}", flush=True)
+
+            try:
+                # Upload all files recursively using fsspec
+                print(
+                    f"[Kubeflow] Uploading {local_checkpoint_path} to {self.storage_protocol}://{storage_path}",
+                    flush=True,
+                )
+                self.storage_fs.put(local_checkpoint_path, storage_path, recursive=True)
+
+                # Delete incomplete marker on success
+                # Use boto3's delete_object (singular) instead of delete_objects (batch)
+                # to avoid MinIO Content-MD5 requirement
+                try:
+                    if self.storage_fs.exists(incomplete_marker):
+                        # Access underlying boto3 client for single file delete
+                        self.storage_fs.rm_file(incomplete_marker)
+                        print("[Kubeflow] Removed incomplete marker", flush=True)
+                except Exception as delete_error:
+                    print(
+                        f"[Kubeflow] Warning: Could not delete incomplete marker: {delete_error}",
+                        flush=True,
+                    )
+
+            except Exception as e:
+                # Keep incomplete marker if upload fails
+                print(
+                    f"[Kubeflow] Upload failed due to: {e}, keeping incomplete marker", flush=True
+                )
+                raise
+
+        def _get_dir_size_mb(self, directory):
+            """Get total size of directory in MB."""
+            total_size = 0
+            for dirpath, _, filenames in os.walk(directory):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    if os.path.exists(filepath):  # Handle broken symlinks
+                        total_size += os.path.getsize(filepath)
+            return total_size / (1024 * 1024)
+
     def apply_checkpointing():
         """Setup monkey patch for Trainer to auto inject JIT checkpoint callback."""
         from transformers import Trainer as _TransformersTrainer
 
-        _jit_checkpoint_callback = JITCheckpointCallback()
+        # Hardcode storage URI for testing (will be configurable via checkpoint_config later)
+        storage_uri = "s3://checkpoint-test/llama-ft"
+
+        _jit_checkpoint_callback = JITCheckpointCallback(storage_uri=storage_uri)
 
         def _find_latest_checkpoint(output_dir):
             """Find the latest checkpoint and deleting incomplete ones."""

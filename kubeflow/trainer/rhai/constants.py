@@ -26,3 +26,7 @@ PVC_URI_SCHEME = "pvc://"
 CHECKPOINT_MOUNT_PATH = "/mnt/kubeflow-checkpoints"
 CHECKPOINT_VOLUME_NAME = "checkpoint-storage"
 CHECKPOINT_INCOMPLETE_MARKER = "checkpoint-is-incomplete.txt"
+
+# S3 storage constants
+S3_URI_SCHEME = "s3://"
+S3_UPLOAD_STAGING_DIR = "s3-upload-staging"
