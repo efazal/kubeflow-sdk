@@ -387,48 +387,111 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
         def on_init_end(self, args, state, control, **kwargs):
             """Download latest checkpoint from storage before training starts.
 
-            Task 4: checkpoint download/resume
-            - Find latest valid checkpoint in storage
-            - Skip checkpoints with .incomplete marker
-            - Download to local output_dir
-            - HuggingFace will auto-resume from local checkpoint
+            Handles FSDP distributed training correctly:
+            - Rank 0 downloads from S3 if checkpoint doesn't exist locally
+            - All ranks wait at barrier after download
+            - All ranks can then load from shared PVC
             """
-            if not self.storage_fs or not state.is_world_process_zero:
+            if not self.storage_fs:
                 return
 
+            # Get rank number for logging
+            rank = 0
             try:
-                print(
-                    f"[Kubeflow] Checking for checkpoints in {self.storage_protocol}...", flush=True
-                )
+                import torch.distributed as dist
 
-                # Find latest valid checkpoint in storage
-                latest_checkpoint = self._find_latest_checkpoint_storage()
-                if not latest_checkpoint:
+                if dist.is_initialized():
+                    rank = dist.get_rank()
+            except Exception:
+                pass
+
+            try:
+                is_rank_0 = state.is_world_process_zero
+
+                # Check if we need to download (checkpoint doesn't exist locally)
+                latest_checkpoint_name = None
+                local_checkpoint_exists = False
+
+                if is_rank_0:
                     print(
-                        "[Kubeflow] No checkpoint found in storage, starting fresh training",
+                        f"[Rank {rank}] Checking for checkpoints in {self.storage_protocol}...",
                         flush=True,
                     )
-                    return
 
-                # Download to local output_dir
-                local_dir = args.output_dir
-                print(
-                    f"[Kubeflow] Downloading checkpoint: {latest_checkpoint} "
-                    f"to path {args.output_dir}",
-                    flush=True,
-                )
-                start_time = time.time()
+                    # Find latest valid checkpoint in storage
+                    latest_checkpoint_name = self._find_latest_checkpoint_storage()
+                    if not latest_checkpoint_name:
+                        print(
+                            f"[Rank {rank}] No checkpoint found in storage, "
+                            f"starting fresh training",
+                            flush=True,
+                        )
+                        # Use barrier to ensure all ranks know there's no checkpoint
+                        try:
+                            import torch.distributed as dist
 
-                self._download_checkpoint_from_storage(latest_checkpoint, local_dir)
+                            if dist.is_initialized():
+                                dist.barrier()
+                        except Exception:
+                            pass
+                        return
 
-                duration = time.time() - start_time
-                print(
-                    f"[Kubeflow] ✓ Download complete: {latest_checkpoint} in {duration:.2f}s",
-                    flush=True,
-                )
+                    # Check if checkpoint already exists locally (from previous run)
+                    local_checkpoint_path = os.path.join(args.output_dir, latest_checkpoint_name)
+                    local_checkpoint_exists = os.path.exists(local_checkpoint_path)
+
+                    if local_checkpoint_exists:
+                        print(
+                            f"[Rank {rank}] Checkpoint already exists "
+                            f"locally: {latest_checkpoint_name}",
+                            flush=True,
+                        )
+                    else:
+                        # Download to local output_dir
+                        print(
+                            f"[Rank {rank}] Downloading checkpoint: "
+                            f"{latest_checkpoint_name} to {args.output_dir}",
+                            flush=True,
+                        )
+                        start_time = time.time()
+
+                        self._download_checkpoint_from_storage(
+                            latest_checkpoint_name, args.output_dir
+                        )
+
+                        duration = time.time() - start_time
+                        print(
+                            f"[Rank {rank}] ✓ Download complete: "
+                            f"{latest_checkpoint_name} in {duration:.2f}s",
+                            flush=True,
+                        )
+
+                # CRITICAL: Use distributed barrier to ensure all
+                # ranks wait for rank 0 to finish download
+                # Without this, rank 1+ will try to load checkpoint
+                # before rank 0 finishes downloading,
+                # causing NCCL timeout errors in FSDP training
+                try:
+                    import torch.distributed as dist
+
+                    if dist.is_initialized():
+                        # All ranks wait here until rank 0 completes download
+                        print(
+                            f"[Rank {rank}] Waiting at barrier for checkpoint sync...", flush=True
+                        )
+                        dist.barrier()
+                        print(
+                            f"[Rank {rank}] Barrier passed, checkpoint ready for loading",
+                            flush=True,
+                        )
+                except Exception as e:
+                    # If barrier fails (e.g., single process run), just continue
+                    print(
+                        f"[Rank {rank}] Warning: Distributed barrier not available: {e}", flush=True
+                    )
 
             except Exception as e:
-                print(f"[Kubeflow] Warning: Failed to download from storage: {e}", flush=True)
+                print(f"[Rank {rank}] Warning: Failed during checkpoint download: {e}", flush=True)
                 import traceback
 
                 traceback.print_exc()
@@ -607,7 +670,7 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
         from transformers import Trainer as _TransformersTrainer
 
         # Hardcode storage URI for testing (will be configurable via checkpoint_config later)
-        storage_uri = "s3://checkpoint-test/llama-ft"
+        storage_uri = "s3://checkpoint-test/sft-finetuning-test"
 
         _jit_checkpoint_callback = JITCheckpointCallback(storage_uri=storage_uri)
 
