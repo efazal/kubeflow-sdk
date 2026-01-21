@@ -673,8 +673,8 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
         """Setup monkey patch for Trainer to auto inject JIT checkpoint callback."""
         from transformers import Trainer as _TransformersTrainer
 
-        # Hardcode storage URI for testing (will be configurable via checkpoint_config later)
-        storage_uri = "s3://checkpoint-test/llama3-test"
+        # Get storage URI from checkpoint config (supports s3://, gs://, az://, etc.)
+        storage_uri = checkpoint_config.get("storage_uri")
 
         _jit_checkpoint_callback = JITCheckpointCallback(storage_uri=storage_uri)
 
@@ -1290,9 +1290,15 @@ def _build_checkpoint_code(trainer: TransformersTrainer) -> str:
 
     resolved_output_dir, _ = parse_output_dir_uri(trainer.output_dir)
 
+    # Extract S3 URI if output_dir uses S3 storage
+    storage_uri = None
+    if trainer.output_dir and trainer.output_dir.startswith(S3_URI_SCHEME):
+        storage_uri = trainer.output_dir
+
     # Generate checkpoint injection code
     return get_jit_checkpoint_injection_code(
         output_dir=resolved_output_dir,
+        storage_uri=storage_uri,
         periodic_checkpoint_config=periodic_config_dict,
         enable_jit_checkpoint=trainer.enable_jit_checkpoint,
     )
@@ -1300,6 +1306,7 @@ def _build_checkpoint_code(trainer: TransformersTrainer) -> str:
 
 def get_jit_checkpoint_injection_code(
     output_dir: Optional[str] = None,
+    storage_uri: Optional[str] = None,
     periodic_checkpoint_config: Optional[dict] = None,
     enable_jit_checkpoint: bool = False,
 ) -> str:
@@ -1311,6 +1318,9 @@ def get_jit_checkpoint_injection_code(
 
     if output_dir:
         config_dict["output_dir"] = output_dir
+
+    if storage_uri:
+        config_dict["storage_uri"] = storage_uri
 
     if periodic_checkpoint_config:
         if "save_strategy" in periodic_checkpoint_config:
