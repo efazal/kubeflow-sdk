@@ -321,7 +321,10 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
                 import subprocess
                 import sys
 
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "s3fs"])
+                # Pin fsspec version to avoid conflicts with datasets package
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "s3fs", "fsspec<=2025.3.0"]
+                )
                 # Parse storage URI: protocol://bucket/prefix
                 self.storage_protocol = storage_uri.split("://")[0]
                 path_part = storage_uri.split("://", 1)[1]
@@ -388,13 +391,44 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
                 control.should_save = False
                 control.should_training_stop = True
 
+        def _should_upload_download(self, args, state):
+            """Determine if this rank should upload/download checkpoints.
+
+            Returns True if:
+            - FSDP with SHARDED_STATE_DICT: All ranks participate (parallel upload/download)
+            - FSDP with FULL_STATE_DICT: Only rank 0
+            - DeepSpeed ZeRO-3: All ranks participate (placeholder for future)
+            - Otherwise: Only rank 0
+            """
+            # Check for FSDP SHARDED_STATE_DICT
+            if (
+                hasattr(args, "fsdp")
+                and args.fsdp
+                and hasattr(args, "fsdp_config")
+                and args.fsdp_config
+            ):
+                state_dict_type = args.fsdp_config.get("state_dict_type", "FULL_STATE_DICT")
+                if state_dict_type == "SHARDED_STATE_DICT":
+                    # All ranks participate in parallel upload/download
+                    return True
+
+            # Check for DeepSpeed (placeholder for future implementation)
+            if hasattr(args, "deepspeed") and args.deepspeed:
+                # TODO: Detect DeepSpeed ZeRO-3 and return True for parallel upload/download
+                # For now, fall back to rank 0 only
+                pass
+
+            # Default: Only rank 0 uploads/downloads
+            return state.is_world_process_zero
+
         def on_init_end(self, args, state, control, **kwargs):
             """Download latest checkpoint from storage before training starts.
 
-            Handles FSDP distributed training correctly:
-            - Rank 0 downloads from S3 if checkpoint doesn't exist locally
-            - All ranks wait at barrier after download
-            - All ranks can then load from shared PVC
+            Handles distributed training correctly:
+            - FSDP SHARDED_STATE_DICT: All ranks download in parallel
+              (each rank gets full checkpoint)
+            - FSDP FULL_STATE_DICT: Rank 0 downloads, all ranks wait at barrier
+            - DeepSpeed: Placeholder for future implementation
             """
             if not self.storage_fs:
                 return
@@ -410,13 +444,17 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
                 pass
 
             try:
+                # Determine if this rank should download
+                should_download = self._should_upload_download(args, state)
                 is_rank_0 = state.is_world_process_zero
 
                 # Check if we need to download (checkpoint doesn't exist locally)
                 latest_checkpoint_name = None
                 local_checkpoint_exists = False
 
-                if is_rank_0:
+                # For FSDP SHARDED_STATE_DICT: All ranks participate
+                # For others: Only rank 0 downloads
+                if should_download or is_rank_0:
                     print(
                         f"[Rank {rank}] Checking for checkpoints in {self.storage_protocol}...",
                         flush=True,
@@ -452,6 +490,9 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
                         )
                     else:
                         # Download to local output_dir
+                        # FSDP SHARDED_STATE_DICT: Each rank downloads full checkpoint
+                        # to its ephemeral volume
+                        # FSDP FULL_STATE_DICT: Only rank 0 downloads to shared volume
                         print(
                             f"[Rank {rank}] Downloading checkpoint: "
                             f"{latest_checkpoint_name} to {args.output_dir}",
@@ -459,8 +500,10 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
                         )
                         start_time = time.time()
 
+                        # Pass rank for selective download in SHARDED_STATE_DICT mode
+                        download_rank = rank if should_download else None
                         self._download_checkpoint_from_storage(
-                            latest_checkpoint_name, args.output_dir
+                            latest_checkpoint_name, args.output_dir, rank=download_rank
                         )
 
                         duration = time.time() - start_time
@@ -471,15 +514,14 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
                         )
 
                 # CRITICAL: Use distributed barrier to ensure all
-                # ranks wait for rank 0 to finish download
-                # Without this, rank 1+ will try to load checkpoint
-                # before rank 0 finishes downloading,
-                # causing NCCL timeout errors in FSDP training
+                # ranks wait for downloads to finish
+                # For FSDP SHARDED_STATE_DICT: Wait for all ranks to finish downloading
+                # For FSDP FULL_STATE_DICT: Wait for rank 0 to finish downloading
                 try:
                     import torch.distributed as dist
 
                     if dist.is_initialized():
-                        # All ranks wait here until rank 0 completes download
+                        # All ranks wait here until downloads complete
                         print(
                             f"[Rank {rank}] Waiting at barrier for checkpoint sync...", flush=True
                         )
@@ -503,15 +545,29 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
         def on_save(self, args, state, control, **kwargs):
             """Upload checkpoint to storage after HuggingFace saves it locally.
 
-            Task 6: Upload checkpoint to storage synchronously
-            - Wait for HuggingFace to finish saving checkpoint
-            - Upload entire checkpoint directory to storage (rank 0 only for now)
-            - Create .incomplete sentinel before upload
-            - Delete .incomplete sentinel after successful upload
-            - Synchronous for now (blocking), will make async in Task 7
+            Handles distributed training correctly:
+            - FSDP SHARDED_STATE_DICT: All ranks upload in parallel
+              (each uploads full checkpoint dir)
+            - FSDP FULL_STATE_DICT: Only rank 0 uploads
+            - DeepSpeed: Placeholder for future implementation
             """
-            if not self.storage_fs or not state.is_world_process_zero:
+            if not self.storage_fs:
                 return
+
+            # Determine if this rank should upload
+            should_upload = self._should_upload_download(args, state)
+            if not should_upload:
+                return
+
+            # Get rank number for logging
+            rank = 0
+            try:
+                import torch.distributed as dist
+
+                if dist.is_initialized():
+                    rank = dist.get_rank()
+            except Exception:
+                pass
 
             try:
                 # Get the checkpoint that was just saved
@@ -520,32 +576,38 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
 
                 if not os.path.exists(local_checkpoint_path):
                     print(
-                        f"[Kubeflow] Warning: Checkpoint not found: {local_checkpoint_path}",
+                        f"[Rank {rank}] Warning: Checkpoint not found: {local_checkpoint_path}",
                         flush=True,
                     )
                     return
 
                 print(
-                    f"[Kubeflow] Uploading checkpoint to {self.storage_protocol}: "
+                    f"[Rank {rank}] Uploading checkpoint to {self.storage_protocol}: "
                     f"{checkpoint_name}",
                     flush=True,
                 )
                 start_time = time.time()
 
                 # Upload checkpoint to storage (synchronous)
-                self._upload_checkpoint_to_storage(local_checkpoint_path, checkpoint_name)
+                # For FSDP SHARDED_STATE_DICT: Each rank uploads only its files (selective)
+                # For FSDP FULL_STATE_DICT: Only rank 0 uploads (all files)
+                upload_rank = rank if should_upload else None
+                is_rank_0 = state.is_world_process_zero
+                self._upload_checkpoint_to_storage(
+                    local_checkpoint_path, checkpoint_name, rank=upload_rank, is_rank_0=is_rank_0
+                )
 
                 duration = time.time() - start_time
                 size_mb = self._get_dir_size_mb(local_checkpoint_path)
                 throughput = size_mb / duration if duration > 0 else 0
                 print(
-                    f"[Kubeflow] ✓ Upload complete: {checkpoint_name} "
+                    f"[Rank {rank}] ✓ Upload complete: {checkpoint_name} "
                     f"({size_mb:.1f}MB in {duration:.2f}s, {throughput:.2f} MB/s)",
                     flush=True,
                 )
 
             except Exception as e:
-                print(f"[Kubeflow] Error uploading to storage: {e}", flush=True)
+                print(f"[Rank {rank}] Error uploading to storage: {e}", flush=True)
                 import traceback
 
                 traceback.print_exc()
@@ -597,65 +659,230 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
                 traceback.print_exc()
                 return None
 
-        def _download_checkpoint_from_storage(self, checkpoint_name, local_dir):
+        def _is_rank_specific_file(self, file_path, rank):
+            """Check if a file is rank-specific for FSDP SHARDED_STATE_DICT.
+
+            Rank-specific files:
+            - Model/optimizer shards: __<rank>_0.distcp
+            - RNG state: rng_state_<rank>.pth
+
+            Shared files (all ranks need):
+            - .metadata files
+            - scheduler.pt
+            - trainer_state.json
+            - config.json
+            - tokenizer files, etc.
+            """
+            filename = os.path.basename(file_path)
+
+            # Pattern 1: Shard files like __0_0.distcp, __1_0.distcp
+            if f"__{rank}_0.distcp" in filename:
+                return True
+
+            # Pattern 2: RNG state files like rng_state_0.pth, rng_state_1.pth
+            return filename == f"rng_state_{rank}.pth"
+
+        def _is_shared_file(self, file_path):
+            """Check if a file is shared across all ranks (not rank-specific).
+
+            Shared files include:
+            - .metadata files
+            - scheduler.pt
+            - trainer_state.json
+            - config files
+            - tokenizer files
+            - Any file that doesn't match rank-specific patterns
+            """
+            filename = os.path.basename(file_path)
+
+            # Shared files patterns
+            shared_patterns = [
+                ".metadata",
+                "scheduler.pt",
+                "trainer_state.json",
+                "config.json",
+                "generation_config.json",
+                "special_tokens_map.json",
+                "tokenizer_config.json",
+                "tokenizer.json",
+                "vocab.json",
+                "merges.txt",
+                "added_tokens.json",
+            ]
+
+            # Check if it matches any shared pattern
+            for pattern in shared_patterns:
+                if pattern in filename:
+                    return True
+
+            # If it doesn't match rank-specific patterns, it's shared
+            # (rank-specific: __<N>_0.distcp or rng_state_<N>.pth)
+            import re
+
+            return not (
+                re.match(r".*__\d+_0\.distcp$", filename)
+                or re.match(r"rng_state_\d+\.pth$", filename)
+            )
+
+        def _download_checkpoint_from_storage(self, checkpoint_name, local_dir, rank=None):
             """Download checkpoint from storage to local directory.
+
+            For FSDP SHARDED_STATE_DICT:
+            - Rank 0: Downloads shared files + ALL shard files
+            - Other ranks: Download ALL shard files only (no shared files)
+            - All ranks need all shards for PyTorch distributed checkpoint loader
+
+            For FSDP FULL_STATE_DICT or single-process:
+            - Downloads entire checkpoint
 
             Args:
                 checkpoint_name: Name of checkpoint (e.g., 'checkpoint-100')
                 local_dir: Local directory to download to (args.output_dir)
+                rank: Rank number for selective download (None = download all)
             """
             storage_path = f"{self.storage_base_path}/{checkpoint_name}"
 
             os.makedirs(local_dir, exist_ok=True)
 
-            # Download all files recursively using fsspec
-            print(
-                f"[Kubeflow] Downloading from {self.storage_protocol}://{storage_path} "
-                f"to {local_dir}",
-                flush=True,
-            )
-            self.storage_fs.get(storage_path, local_dir, recursive=True)
+            if rank is None:
+                # Download all files (FULL_STATE_DICT or single process)
+                print(
+                    f"[Kubeflow] Downloading from {self.storage_protocol}://{storage_path} "
+                    f"to {local_dir}",
+                    flush=True,
+                )
+                self.storage_fs.get(storage_path, local_dir, recursive=True)
+            else:
+                # Selective download for SHARDED_STATE_DICT
+                # List all files in the checkpoint
+                all_files = self.storage_fs.find(storage_path)
 
-        def _upload_checkpoint_to_storage(self, local_checkpoint_path, checkpoint_name):
+                files_to_download = []
+                is_rank_0 = rank == 0
+
+                for remote_file in all_files:
+                    # Get relative path within checkpoint
+                    rel_path = remote_file.replace(f"{storage_path}/", "")
+
+                    is_shared = self._is_shared_file(rel_path)
+                    is_my_shard = self._is_rank_specific_file(rel_path, rank)
+
+                    if is_rank_0:
+                        # Rank 0: download everything (orchestrates checkpoint loading)
+                        files_to_download.append(remote_file)
+                    else:
+                        # Other ranks: download shared files + only their own shard
+                        if is_shared or is_my_shard:
+                            files_to_download.append(remote_file)
+
+                download_desc = "all files" if is_rank_0 else f"shared + rank-{rank} shard"
+                print(
+                    f"[Rank {rank}] Downloading {len(files_to_download)} files "
+                    f"({download_desc}) from {self.storage_protocol}://{storage_path}",
+                    flush=True,
+                )
+
+                # Download each file
+                for remote_file in files_to_download:
+                    # Get relative path and construct local path
+                    rel_path = remote_file.replace(f"{storage_path}/", "")
+                    local_file = os.path.join(local_dir, checkpoint_name, rel_path)
+
+                    # Create parent directory
+                    os.makedirs(os.path.dirname(local_file), exist_ok=True)
+
+                    # Download file
+                    self.storage_fs.get(remote_file, local_file)
+
+        def _upload_checkpoint_to_storage(
+            self, local_checkpoint_path, checkpoint_name, rank=None, is_rank_0=False
+        ):
             """Upload checkpoint from local directory to storage.
+
+            For FSDP SHARDED_STATE_DICT:
+            - Rank 0: Uploads shared files + its own shards
+            - Other ranks: Upload only their own shards
+
+            For FSDP FULL_STATE_DICT or single-process:
+            - Uploads entire checkpoint
 
             Args:
                 local_checkpoint_path: Local path to checkpoint directory
                 checkpoint_name: Name of checkpoint (e.g., 'checkpoint-100')
+                rank: Rank number for selective upload (None = upload all)
+                is_rank_0: Whether this is rank 0 (for incomplete marker handling)
             """
             storage_path = f"{self.storage_base_path}"
 
-            # Create incomplete marker to indicate upload in progress
+            # Create incomplete marker to indicate upload in progress (only rank 0)
             incomplete_marker = f"{storage_path}/{checkpoint_name}/{CHECKPOINT_INCOMPLETE_MARKER}"
-            self.storage_fs.touch(incomplete_marker)
-            print(f"[Kubeflow] Created incomplete marker: {incomplete_marker}", flush=True)
+            if is_rank_0:
+                self.storage_fs.touch(incomplete_marker)
+                print(f"[Rank 0] Created incomplete marker: {incomplete_marker}", flush=True)
 
             try:
-                # Upload all files recursively using fsspec
-                print(
-                    f"[Kubeflow] Uploading {local_checkpoint_path} to {self.storage_protocol}://{storage_path}",
-                    flush=True,
-                )
-                self.storage_fs.put(local_checkpoint_path, storage_path, recursive=True)
-
-                # Delete incomplete marker on success
-                # Use boto3's delete_object (singular) instead of delete_objects (batch)
-                # to avoid MinIO Content-MD5 requirement
-                try:
-                    if self.storage_fs.exists(incomplete_marker):
-                        # Access underlying boto3 client for single file delete
-                        self.storage_fs.rm_file(incomplete_marker)
-                        print("[Kubeflow] Removed incomplete marker", flush=True)
-                except Exception as delete_error:
+                if rank is None:
+                    # Upload all files (FULL_STATE_DICT or single process)
                     print(
-                        f"[Kubeflow] Warning: Could not delete incomplete marker: {delete_error}",
+                        f"[Kubeflow] Uploading {local_checkpoint_path} to {self.storage_protocol}://{storage_path}",
+                        flush=True,
+                    )
+                    self.storage_fs.put(local_checkpoint_path, storage_path, recursive=True)
+                else:
+                    # Selective upload for SHARDED_STATE_DICT
+                    # Walk local directory and find files to upload
+                    files_to_upload = []
+                    for dirpath, _, filenames in os.walk(local_checkpoint_path):
+                        for filename in filenames:
+                            local_file = os.path.join(dirpath, filename)
+                            # Get relative path within checkpoint
+                            rel_path = os.path.relpath(local_file, local_checkpoint_path)
+
+                            # Upload if:
+                            # - Rank 0: shared files OR rank 0 specific files
+                            # - Other ranks: only their own rank-specific files
+                            if is_rank_0:
+                                # Rank 0 uploads shared files AND its own shards
+                                if self._is_shared_file(rel_path) or self._is_rank_specific_file(
+                                    rel_path, rank
+                                ):
+                                    files_to_upload.append((local_file, rel_path))
+                            else:
+                                # Other ranks upload only their own shards
+                                if self._is_rank_specific_file(rel_path, rank):
+                                    files_to_upload.append((local_file, rel_path))
+
+                    shard_desc = f"shared + rank-{rank}" if is_rank_0 else f"rank-{rank}"
+                    print(
+                        f"[Rank {rank}] Uploading {len(files_to_upload)} files "
+                        f"({shard_desc} shards) "
+                        f"to {self.storage_protocol}://{storage_path}/{checkpoint_name}",
                         flush=True,
                     )
 
+                    # Upload each file
+                    for local_file, rel_path in files_to_upload:
+                        remote_file = f"{storage_path}/{checkpoint_name}/{rel_path}"
+                        self.storage_fs.put(local_file, remote_file)
+
+                # Delete incomplete marker on success (only rank 0)
+                if is_rank_0:
+                    try:
+                        if self.storage_fs.exists(incomplete_marker):
+                            # Access underlying boto3 client for single file delete
+                            self.storage_fs.rm_file(incomplete_marker)
+                            print("[Rank 0] Removed incomplete marker", flush=True)
+                    except Exception as delete_error:
+                        print(
+                            f"[Rank 0] Warning: Could not delete incomplete marker: {delete_error}",
+                            flush=True,
+                        )
+
             except Exception as e:
                 # Keep incomplete marker if upload fails
+                rank_msg = f"[Rank {rank}]" if rank is not None else "[Kubeflow]"
                 print(
-                    f"[Kubeflow] Upload failed due to: {e}, keeping incomplete marker", flush=True
+                    f"{rank_msg} Upload failed due to: {e}, keeping incomplete marker", flush=True
                 )
                 raise
 
