@@ -13,6 +13,7 @@ from kubeflow.trainer.rhai.constants import (
     CHECKPOINT_MOUNT_PATH,
     CHECKPOINT_VOLUME_NAME,
     PVC_URI_SCHEME,
+    S3_URI_SCHEME,
 )
 from kubeflow.trainer.types import types
 
@@ -85,6 +86,11 @@ def merge_progression_annotations(
 def parse_output_dir_uri(output_dir: Optional[str]) -> tuple[Optional[str], Optional[dict]]:
     """
     Parse output_dir URI and return resolved path and volume mount specs.
+
+    Supports:
+    - pvc://<pvc-name>/<path> - Mounts existing PVC
+    - s3://<bucket>/<path> - Creates empheral Volume for local staging
+    - Local filesystem paths - No volume mounting
     """
     if not output_dir:
         return None, None
@@ -110,6 +116,36 @@ def parse_output_dir_uri(output_dir: Optional[str]) -> tuple[Optional[str], Opti
         volume_spec = {
             "name": CHECKPOINT_VOLUME_NAME,
             "persistentVolumeClaim": {"claimName": pvc_name},
+        }
+        volume_mount_spec = {
+            "name": CHECKPOINT_VOLUME_NAME,
+            "mountPath": mount_path,
+            "readOnly": False,
+        }
+
+        return resolved_path, {"volume": volume_spec, "volumeMount": volume_mount_spec}
+
+    if output_dir.startswith(S3_URI_SCHEME):
+        # For S3 storage, use ephemeral volume for local staging
+        # The actual S3 URI will be passed separately to checkpoint code
+        mount_path = CHECKPOINT_MOUNT_PATH
+        resolved_path = mount_path
+
+        # Build ephemeral volume spec with volumeClaimTemplate
+        volume_spec = {
+            "name": CHECKPOINT_VOLUME_NAME,
+            "ephemeral": {
+                "volumeClaimTemplate": {
+                    "spec": {
+                        "accessModes": ["ReadWriteOnce"],
+                        "resources": {
+                            "requests": {
+                                "storage": models.IoK8sApimachineryPkgApiResourceQuantity("50Gi")
+                            }
+                        },
+                    }
+                }
+            },
         }
         volume_mount_spec = {
             "name": CHECKPOINT_VOLUME_NAME,

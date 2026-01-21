@@ -23,7 +23,7 @@ from typing import Callable, Optional
 from kubeflow_trainer_api import models
 
 from kubeflow.trainer.constants import constants
-from kubeflow.trainer.rhai.constants import PVC_URI_SCHEME
+from kubeflow.trainer.rhai.constants import PVC_URI_SCHEME, S3_URI_SCHEME
 from kubeflow.trainer.types import types
 
 
@@ -156,16 +156,20 @@ class TransformersTrainer:
                 f"metrics_poll_interval_seconds must be in range 5-300, "
                 f"got {self.metrics_poll_interval_seconds}"
             )
-        # Only allow pvc:// or paths without URI schemes
+        # Only allow pvc://, s3://, or paths without URI schemes
         if (
             self.output_dir
             and "://" in self.output_dir
-            and not self.output_dir.startswith(PVC_URI_SCHEME)
+            and not (
+                self.output_dir.startswith(PVC_URI_SCHEME)
+                or self.output_dir.startswith(S3_URI_SCHEME)
+            )
         ):
             raise ValueError(
                 f"Unsupported storage URI scheme. "
-                f"Currently only '{PVC_URI_SCHEME}' URIs are supported for automatic mounting. "
-                f"Supported formats: '{PVC_URI_SCHEME}<pvc-name>/<path>' or local filesystem paths."
+                f"Currently only '{PVC_URI_SCHEME}' and '{S3_URI_SCHEME}' URIs are supported. "
+                f"Supported formats: '{PVC_URI_SCHEME}<pvc-name>/<path>', "
+                f"'{S3_URI_SCHEME}<bucket>/<path>', or local filesystem paths."
             )
 
         # Auto-enable JIT checkpoint if output_dir is provided
@@ -670,7 +674,7 @@ def _create_checkpoint_instrumentation(checkpoint_config: dict) -> tuple:
         from transformers import Trainer as _TransformersTrainer
 
         # Hardcode storage URI for testing (will be configurable via checkpoint_config later)
-        storage_uri = "s3://checkpoint-test/sft-finetuning-test"
+        storage_uri = "s3://checkpoint-test/llama3-test"
 
         _jit_checkpoint_callback = JITCheckpointCallback(storage_uri=storage_uri)
 
