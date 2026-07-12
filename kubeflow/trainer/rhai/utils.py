@@ -10,6 +10,7 @@ from kubernetes.client.rest import ApiException
 from kubeflow.trainer.constants import constants
 from kubeflow.trainer.rhai import (
     RHAITrainer,
+    speculator,
     traininghub,
     transformers,
 )
@@ -80,6 +81,13 @@ def get_trainer_cr_from_rhai_trainer(
 
     elif isinstance(trainer, transformers.TransformersTrainer):
         return transformers.get_trainer_cr_from_transformers_trainer(
+            runtime,
+            trainer,
+            initializer,
+        )
+
+    elif isinstance(trainer, speculator.SpeculatorTrainer):
+        return speculator.get_trainer_cr_from_speculator_trainer(
             runtime,
             trainer,
             initializer,
@@ -464,6 +472,113 @@ def inject_cloud_storage_credentials(
     return trainer_cr
 
 
+def apply_speculator_sidecar_overrides(
+    trainer: "speculator.SpeculatorTrainer",
+    resolved_output_dir: str | None,
+    pod_template_overrides: list,
+) -> list:
+    """Configure the vLLM sidecar init container for speculator data extraction.
+
+    For data_only and online modes, the CTR includes a vLLM sidecar that needs:
+    - SPECULATOR_VERIFIER_MODEL env var (which model to serve)
+    - SPECULATOR_HS_PATH env var (where to write hidden states)
+    - Volume mount for the PVC (same mount as the main container)
+
+    This function adds these overrides to podTemplateOverrides so the user
+    doesn't have to configure the sidecar manually.
+
+    Args:
+        trainer: SpeculatorTrainer instance.
+        resolved_output_dir: Resolved local path from output_dir PVC URI.
+        pod_template_overrides: Existing pod template overrides list.
+
+    Returns:
+        Updated pod_template_overrides list.
+    """
+    from kubeflow.trainer.rhai.constants import (
+        CHECKPOINT_MOUNT_PATH,
+        CHECKPOINT_VOLUME_NAME,
+        SPECULATOR_ENV_HS_PATH,
+        SPECULATOR_ENV_VERIFIER_MODEL,
+        SPECULATOR_HIDDEN_STATES_SUBDIR,
+        SPECULATOR_SIDECAR_NAME,
+    )
+
+    hs_path = (
+        resolved_output_dir + "/" + SPECULATOR_HIDDEN_STATES_SUBDIR
+        if resolved_output_dir
+        else "/tmp/hidden_states"
+    )
+
+    node_override = None
+    for override in pod_template_overrides:
+        target_jobs = override.get("targetJobs", [])
+        if any(job.get("name") == constants.NODE for job in target_jobs):
+            node_override = override
+            break
+
+    if node_override is None:
+        return pod_template_overrides
+
+    spec_dict = node_override.setdefault("spec", {})
+    init_containers = spec_dict.setdefault("initContainers", [])
+
+    sidecar_dict = None
+    for ic in init_containers:
+        if ic.get("name") == SPECULATOR_SIDECAR_NAME:
+            sidecar_dict = ic
+            break
+
+    if sidecar_dict is None:
+        sidecar_dict = {"name": SPECULATOR_SIDECAR_NAME}
+        init_containers.append(sidecar_dict)
+
+    sidecar_env = sidecar_dict.setdefault("env", [])
+    existing_env_names = {e.get("name") for e in sidecar_env}
+
+    if SPECULATOR_ENV_VERIFIER_MODEL not in existing_env_names:
+        sidecar_env.append(
+            {
+                "name": SPECULATOR_ENV_VERIFIER_MODEL,
+                "value": trainer.verifier_model,
+            }
+        )
+    if SPECULATOR_ENV_HS_PATH not in existing_env_names:
+        sidecar_env.append(
+            {
+                "name": SPECULATOR_ENV_HS_PATH,
+                "value": hs_path,
+            }
+        )
+    if "SPECULATOR_GPU_MEM_UTIL" not in existing_env_names:
+        sidecar_env.append(
+            {
+                "name": "SPECULATOR_GPU_MEM_UTIL",
+                "value": str(trainer.vllm_gpu_memory_utilization),
+            }
+        )
+    if "SPECULATOR_VLLM_GPU_COUNT" not in existing_env_names:
+        sidecar_env.append(
+            {
+                "name": "SPECULATOR_VLLM_GPU_COUNT",
+                "value": str(trainer.vllm_gpu_count),
+            }
+        )
+
+    sidecar_mounts = sidecar_dict.setdefault("volumeMounts", [])
+    existing_mount_names = {m.get("name") for m in sidecar_mounts}
+
+    if CHECKPOINT_VOLUME_NAME not in existing_mount_names:
+        sidecar_mounts.append(
+            {
+                "name": CHECKPOINT_VOLUME_NAME,
+                "mountPath": CHECKPOINT_MOUNT_PATH,
+            }
+        )
+
+    return pod_template_overrides
+
+
 def setup_rhai_trainer_storage(
     trainer: RHAITrainer,
     trainer_cr: "models.TrainerV1alpha1Trainer",
@@ -496,6 +611,17 @@ def setup_rhai_trainer_storage(
         )
     else:
         pod_template_overrides = pod_template_overrides or []
+
+    # For SpeculatorTrainer sidecar modes, configure the vLLM sidecar container
+    from kubeflow.trainer.rhai.speculator import SpeculatorMode, SpeculatorTrainer
+
+    if isinstance(trainer, SpeculatorTrainer) and trainer.mode in (
+        SpeculatorMode.DATA_ONLY,
+        SpeculatorMode.ONLINE,
+    ):
+        pod_template_overrides = apply_speculator_sidecar_overrides(
+            trainer, resolved_output_dir, pod_template_overrides
+        )
 
     # Inject cloud storage credentials if applicable
     trainer_cr = inject_cloud_storage_credentials(trainer, trainer_cr, core_api, namespace)
