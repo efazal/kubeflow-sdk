@@ -81,6 +81,11 @@ Source = "https://github.com/kubeflow/sdk"
 path = "kubeflow/__init__.py"
 
 [tool.uv]
+# Security overrides - Review periodically and remove if parent constraints allow natural upgrade
+override-dependencies = [
+    # urllib3==2.8.0 - Added 2026-10-03 for security fix - https://github.com/urllib3/urllib3/security/advisories/GHSA-8988-9cw3-xx77
+    "urllib3==2.8.0",
+]
 package = true
 
 [build-system]
