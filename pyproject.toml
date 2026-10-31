@@ -81,6 +81,11 @@ Source = "https://github.com/kubeflow/sdk"
 path = "kubeflow/__init__.py"
 
 [tool.uv]
+# Security overrides - Review periodically and remove if parent constraints allow natural upgrade
+override-dependencies = [
+    # filelock==4.2.1 - Added 2026-10-31 for security fix - https://github.com/tox-dev/filelock/security/advisories/GHSA-567q-5qvw-pf92
+    "filelock==4.2.1",
+]
 package = true
 
 [build-system]
